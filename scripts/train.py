@@ -19,7 +19,6 @@ from ddpo_pytorch.stat_tracking import PerPromptStatTracker
 from ddpo_pytorch.diffusers_patch.pipeline_with_logprob import pipeline_with_logprob
 from ddpo_pytorch.diffusers_patch.ddim_with_logprob import ddim_step_with_logprob
 import torch
-import wandb
 from functools import partial
 import tqdm
 import tempfile
@@ -90,7 +89,6 @@ def main(_):
     if config.resume_from:
         config.resume_from = os.path.normpath(os.path.expanduser(config.resume_from))
         if "checkpoint_" not in os.path.basename(config.resume_from):
-            # get the most recent checkpoint in this directory
             checkpoints = list(
                 filter(lambda x: "checkpoint_" in x, os.listdir(config.resume_from))
             )
@@ -101,7 +99,6 @@ def main(_):
                 sorted(checkpoints, key=lambda x: int(x.split("_")[-1]))[-1],
             )
 
-    # number of timesteps within each trajectory to train on
     num_train_timesteps = int(config.sample.num_steps * config.train.timestep_fraction)
 
     accelerator_config = ProjectConfiguration(
@@ -111,25 +108,30 @@ def main(_):
     )
 
     accelerator = Accelerator(
-        log_with="wandb",
         mixed_precision=config.mixed_precision,
         project_config=accelerator_config,
-        # we always accumulate gradients across timesteps; we want config.train.gradient_accumulation_steps to be the
-        # number of *samples* we accumulate across, so we need to multiply by the number of training timesteps to get
-        # the total number of optimizer steps to accumulate across.
-        gradient_accumulation_steps=config.train.gradient_accumulation_steps
-        * num_train_timesteps,
+        gradient_accumulation_steps=config.train.gradient_accumulation_steps * num_train_timesteps,
     )
-    if accelerator.is_main_process:
-        accelerator.init_trackers(
-            project_name="ddpo-pytorch",
-            config=config.to_dict(),
-            init_kwargs={"wandb": {"name": config.run_name}},
-        )
+
     logger.info(f"\n{config}")
 
+    # 验证配置
+    assert config.sample.batch_size >= config.train.batch_size, "采样批次大小必须大于等于训练批次大小"
+    assert config.sample.batch_size % config.train.batch_size == 0, "采样批次大小必须是训练批次大小的整数倍"
+    assert config.train.group_size > 0, "组大小必须大于0"
+    assert config.train.beta > 0, "KL散度系数必须大于0"
+    assert config.train.epsilon > 0, "裁剪范围必须大于0"
+    assert 0 <= config.train.reference_model_mixup_alpha <= 1, "参考模型混合系数必须在0到1之间"
+    
     # set seed (device_specific is very important to get different prompts on different devices)
     set_seed(config.seed, device_specific=True)
+
+    # 在这里定义 inference_dtype
+    inference_dtype = torch.float32
+    if accelerator.mixed_precision == "fp16":
+        inference_dtype = torch.float16
+    elif accelerator.mixed_precision == "bf16":
+        inference_dtype = torch.bfloat16
 
     # load scheduler, tokenizer and models.
     pipeline = StableDiffusionPipeline.from_pretrained(
@@ -164,14 +166,6 @@ def main(_):
     )
     # switch to DDIM scheduler
     pipeline.scheduler = DDIMScheduler.from_config(pipeline.scheduler.config)
-
-    # For mixed precision training we cast all non-trainable weigths (vae, non-lora text_encoder and non-lora unet) to half-precision
-    # as these weights are only used for inference, keeping weights in full precision is not required.
-    inference_dtype = torch.float32
-    if accelerator.mixed_precision == "fp16":
-        inference_dtype = torch.float16
-    elif accelerator.mixed_precision == "bf16":
-        inference_dtype = torch.bfloat16
 
     # Move unet, vae and text_encoder to device and cast to inference_dtype
     pipeline.vae.to(accelerator.device, dtype=inference_dtype)
@@ -457,39 +451,19 @@ def main(_):
                 )
                 pil = pil.resize((256, 256))
                 pil.save(os.path.join(tmpdir, f"{i}.jpg"))
-            accelerator.log(
-                {
-                    "images": [
-                        wandb.Image(
-                            os.path.join(tmpdir, f"{i}.jpg"),
-                            caption=f"{prompt:.25} | {reward:.2f}",
-                        )
-                        for i, (prompt, reward) in enumerate(
-                            zip(prompts, rewards)
-                        )  # only log rewards from process 0
-                    ],
-                },
-                step=global_step,
-            )
 
         # gather rewards across processes
         rewards = accelerator.gather(samples["rewards"]).cpu().numpy()
 
+        # 初始化 info 字典
+        info = defaultdict(list)
+
         # log rewards and images
-        accelerator.log(
-            {
-                "reward": rewards,
-                "epoch": epoch,
-                "reward_mean": rewards.mean(),
-                "reward_std": rewards.std(),
-                "group_reward_mean": rewards.reshape(-1, config.train.group_size).mean(axis=1).mean(),
-                "group_reward_std": rewards.reshape(-1, config.train.group_size).mean(axis=1).std(),
-                "group_advantage_mean": advantages.reshape(-1, config.train.group_size).mean(axis=1).mean(),
-                "group_advantage_std": advantages.reshape(-1, config.train.group_size).mean(axis=1).std(),
-                "kl_div": info["approx_kl"][-1] if info["approx_kl"] else 0.0,
-                "reference_model_synced": epoch % config.train.reference_update_freq == 0 if config.train.use_reference_model else False,
-            },
-            step=global_step,
+        logger.info(
+            f"Epoch {epoch}: reward = {rewards.mean():.3f} ± {rewards.std():.3f}, "
+            f"group_reward = {rewards.reshape(-1, config.train.group_size).mean(axis=1).mean():.3f} ± "
+            f"{rewards.reshape(-1, config.train.group_size).mean(axis=1).std():.3f}, "
+            f"kl_div = {info['approx_kl'][-1] if info['approx_kl'] else 0.0:.3f}"
         )
 
         # per-prompt mean/std tracking
@@ -628,6 +602,13 @@ def main(_):
                             )
                         )
                         info["loss"].append(loss)
+                        
+                        # 监控内存使用
+                        if accelerator.is_local_main_process:
+                            memory_allocated = torch.cuda.memory_allocated() / 1024**2
+                            memory_reserved = torch.cuda.memory_reserved() / 1024**2
+                            info["memory_allocated"] = memory_allocated
+                            info["memory_reserved"] = memory_reserved
 
                         # backward pass
                         accelerator.backward(loss)
@@ -647,7 +628,7 @@ def main(_):
                         info = {k: torch.mean(torch.stack(v)) for k, v in info.items()}
                         info = accelerator.reduce(info, reduction="mean")
                         info.update({"epoch": epoch, "inner_epoch": inner_epoch})
-                        accelerator.log(info, step=global_step)
+                        logger.info(f"Training info: {info}")
                         global_step += 1
                         info = defaultdict(list)
 
@@ -657,6 +638,7 @@ def main(_):
         # 更新参考模型
         if config.train.use_reference_model and epoch % config.train.reference_update_freq == 0:
             with torch.no_grad():
+                reference_pipeline.unet.eval()
                 for param, ref_param in zip(pipeline.unet.parameters(), reference_pipeline.unet.parameters()):
                     ref_param.data = (
                         config.train.reference_model_mixup_alpha * ref_param.data +
@@ -666,6 +648,11 @@ def main(_):
 
         if epoch != 0 and epoch % config.save_freq == 0 and accelerator.is_main_process:
             accelerator.save_state()
+            
+        # 清理内存
+        del samples
+        torch.cuda.empty_cache()
+        logger.info("Cleared memory cache")
 
 
 if __name__ == "__main__":

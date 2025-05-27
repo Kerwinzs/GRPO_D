@@ -3,9 +3,10 @@ from collections import deque, defaultdict
 
 
 class PerPromptStatTracker:
-    def __init__(self, buffer_size, min_count):
+    def __init__(self, buffer_size, min_count, group_size=4):
         self.buffer_size = buffer_size
         self.min_count = min_count
+        self.group_size = group_size
         self.stats = defaultdict(lambda: {"rewards": [], "count": 0})
         
     def update(self, prompts, rewards):

@@ -5,7 +5,7 @@ def get_config():
     config = ml_collections.ConfigDict()
 
     ###### General ######
-    # run name for wandb logging and checkpoint saving -- if not provided, will be auto-generated based on the datetime.
+    # run name for checkpoint saving -- if not provided, will be auto-generated based on the datetime.
     config.run_name = ""
     # random seed for reproducibility.
     config.seed = 42
@@ -84,8 +84,6 @@ def get_config():
     train.cfg = True
     # clip advantages to the range [-adv_clip_max, adv_clip_max].
     train.adv_clip_max = 5
-    # the PPO clip range.
-    train.clip_range = 1e-4
     # the fraction of timesteps to train on. if set to less than 1.0, the model will be trained on a subset of the
     # timesteps for each sample. this will speed up training but reduce the accuracy of policy gradient estimates.
     train.timestep_fraction = 1.0
