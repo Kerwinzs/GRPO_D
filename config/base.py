@@ -19,7 +19,7 @@ def get_config():
     # number of checkpoints to keep before overwriting old ones.
     config.num_checkpoint_limit = 5
     # mixed precision training. options are "fp16", "bf16", and "no". half-precision speeds up training significantly.
-    config.mixed_precision = "no"
+    config.mixed_precision = "fp16"
     # allow tf32 on Ampere GPUs, which can speed up training.
     config.allow_tf32 = True
     # resume training from a checkpoint. either an exact checkpoint directory (e.g. checkpoint_50), or a directory
@@ -43,24 +43,24 @@ def get_config():
     ###### Sampling ######
     config.sample = sample = ml_collections.ConfigDict()
     # number of sampler inference steps.
-    sample.num_steps = 20
+    sample.num_steps = 5
     # eta parameter for the DDIM sampler. this controls the amount of noise injected into the sampling process, with 0.0
     # being fully deterministic and 1.0 being equivalent to the DDPM sampler.
     sample.eta = 1.0
     # classifier-free guidance weight. 1.0 is no guidance.
     sample.guidance_scale = 5.0
     # batch size (per GPU!) to use for sampling.
-    sample.batch_size = 4
+    sample.batch_size = 1
     # number of batches to sample per epoch. the total number of samples per epoch is `num_batches_per_epoch *
     # batch_size * num_gpus`.
-    sample.num_batches_per_epoch = 2
+    sample.num_batches_per_epoch = 1
 
     ###### Training ######
     config.train = train = ml_collections.ConfigDict()
     # batch size (per GPU!) to use for training.
-    train.batch_size = 2
+    train.batch_size = 1
     # whether to use the 8bit Adam optimizer from bitsandbytes.
-    train.use_8bit_adam = False
+    train.use_8bit_adam = True
     # learning rate.
     train.learning_rate = 1e-5
     # Adam beta1.
@@ -90,7 +90,7 @@ def get_config():
 
     # GRPO specific configurations
     # number of samples in each group for group-level optimization
-    train.group_size = 4
+    train.group_size = 1
     # KL divergence coefficient for GRPO
     train.beta = 0.04
     # clipping range for GRPO

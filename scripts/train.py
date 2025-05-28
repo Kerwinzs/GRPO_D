@@ -143,9 +143,21 @@ def main(_):
         reference_pipeline = StableDiffusionPipeline.from_pretrained(
             config.pretrained.model, revision=config.pretrained.revision
         )
-        reference_pipeline.to(accelerator.device, dtype=inference_dtype)
-        reference_pipeline.eval()
-        for param in reference_pipeline.parameters():
+        reference_pipeline.to(accelerator.device)
+        # 分别设置每个组件的dtype
+        reference_pipeline.vae.to(dtype=inference_dtype)
+        reference_pipeline.text_encoder.to(dtype=inference_dtype)
+        reference_pipeline.unet.to(dtype=inference_dtype)
+        # 设置模型组件为评估模式
+        reference_pipeline.unet.eval()
+        reference_pipeline.vae.eval()
+        reference_pipeline.text_encoder.eval()
+        # 冻结所有模型组件的参数
+        for param in reference_pipeline.unet.parameters():
+            param.requires_grad_(False)
+        for param in reference_pipeline.vae.parameters():
+            param.requires_grad_(False)
+        for param in reference_pipeline.text_encoder.parameters():
             param.requires_grad_(False)
     else:
         reference_pipeline = None
@@ -638,7 +650,12 @@ def main(_):
         # 更新参考模型
         if config.train.use_reference_model and epoch % config.train.reference_update_freq == 0:
             with torch.no_grad():
+                # 确保模型在评估模式
                 reference_pipeline.unet.eval()
+                reference_pipeline.vae.eval()
+                reference_pipeline.text_encoder.eval()
+                
+                # 更新UNet参数
                 for param, ref_param in zip(pipeline.unet.parameters(), reference_pipeline.unet.parameters()):
                     ref_param.data = (
                         config.train.reference_model_mixup_alpha * ref_param.data +
